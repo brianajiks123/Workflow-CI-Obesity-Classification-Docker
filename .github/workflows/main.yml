@@ -1,0 +1,113 @@
+name: CI/CD MLflow
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CSV_PATH: "${{ github.workspace }}/obesity_MLproject/Obesity_preprocessing.csv"
+  MLFLOW_TRACKING_URI: "file://${{ github.workspace }}/mlruns"
+
+jobs:
+  build-and-package:
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.mlflow_run.outputs.run_id }}
+      run_dir: ${{ steps.mlflow_run.outputs.run_dir }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Miniconda
+        uses: conda-incubator/setup-miniconda@v2
+        with:
+          auto-update-conda: true
+          python-version: 3.12.7
+
+      - name: Create Conda environment
+        run: conda env create -f obesity_MLproject/conda.yaml
+
+      - name: Activate env & install MLflow & GH CLI
+        shell: bash -l {0}
+        run: |
+          conda activate mlflow-env
+          pip install --upgrade mlflow gh
+
+      - name: Verify CSV exists
+        run: |
+          if [ ! -f "$CSV_PATH" ]; then
+            echo "❌ CSV not found at $CSV_PATH"
+            exit 1
+          fi
+
+      - name: Run MLflow Project
+        id: mlflow_run
+        shell: bash -l {0}
+        run: |
+          conda activate mlflow-env
+          mlflow run obesity_MLproject \
+            --experiment-name "AllRuns_CI" \
+            -P input="$CSV_PATH" \
+            -P mode="local" \
+            -P local_uri="$MLFLOW_TRACKING_URI"
+
+          RUN_DIR=$(ls -dt mlruns/*/*/ | head -n1)
+          RUN_ID=$(basename "$RUN_DIR")
+          echo "run_id=$RUN_ID"   >> $GITHUB_OUTPUT
+          echo "run_dir=$RUN_DIR" >> $GITHUB_OUTPUT
+
+      - name: Zip model artifact
+        shell: bash -l {0}
+        run: |
+          cd "${{ steps.mlflow_run.outputs.run_dir }}/artifacts"
+          zip -r model-${{ steps.mlflow_run.outputs.run_id }}.zip model
+          echo "zip_path=${{ steps.mlflow_run.outputs.run_dir }}/artifacts/model-${{ steps.mlflow_run.outputs.run_id }}.zip" >> $GITHUB_ENV
+
+      - name: Upload model artifact to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: obesity-model
+          path: ${{ env.zip_path }}
+
+      - name: Create GitHub Release & upload model
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash -l {0}
+        run: |
+          TAG="mlflow-model-${{ steps.mlflow_run.outputs.run_id }}"
+          ZIP="${{ env.zip_path }}"
+          gh release create "$TAG" "$ZIP" \
+            --repo "${{ github.repository }}" \
+            --title "MLflow Model ${{ steps.mlflow_run.outputs.run_id }}" \
+            --notes "Automated release for MLflow run ${{ steps.mlflow_run.outputs.run_id }}"
+
+      - name: Build Docker image
+        shell: bash -l {0}
+        env:
+          MLFLOW_DISABLE_ENV_MANAGER_CONDA_WARNING: "TRUE"
+        run: |
+          set -x
+          conda activate mlflow-env
+          echo ">>> Using RUN_ID=${{ steps.mlflow_run.outputs.run_id }}"
+          mlflow models build-docker \
+            --model-uri "runs:/${{ steps.mlflow_run.outputs.run_id }}/model" \
+            --name obesity_classification \
+            --env-manager conda
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Tag & Push Docker image
+        run: |
+          docker tag obesity_classification:latest \
+            ${{ secrets.DOCKER_HUB_USERNAME }}/obesity_classification:latest
+          docker push ${{ secrets.DOCKER_HUB_USERNAME }}/obesity_classification:latest
